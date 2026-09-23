@@ -18,10 +18,19 @@ from .cross_encoder import DEFAULT_MODELS, run_cross_encoder
 from .data import BenchmarkData, load_nanobeir
 from .evaluation import bm25_rankings, candidate_recall, evaluate, oracle_rankings, rank_scores, select_qualitative_cases
 from .jev_client import BINARY_CRITERIA, BINARY_INSTRUCTIONS, GRADED_CRITERIA, GRADED_INSTRUCTIONS, JevClient, build_payload
+from .llm_client import (
+    BINARY_PROMPT as PROVIDER_BINARY_PROMPT,
+    GRADED_PROMPT as PROVIDER_GRADED_PROMPT,
+    ProviderClient,
+    build_provider_payload,
+    method_provider,
+)
 from .models import MethodResult, QueryExample
 from .reporting import build_report, create_chart, efficiency, promote, top_document_records, write_json, write_jsonl, write_metrics_csv
 
-ALL_METHODS = ("bm25", "minilm-l4", "minilm-l6", "jev-binary", "jev-graded")
+DEFAULT_METHODS = ("bm25", "minilm-l4", "minilm-l6", "jev-binary", "jev-graded")
+PROVIDER_METHODS = ("openai-binary", "openai-graded", "gemini-binary", "gemini-graded")
+ALL_METHODS = DEFAULT_METHODS + PROVIDER_METHODS
 OUTPUT_FILES = ("config.json", "metrics.json", "metrics.csv", "pair_scores.jsonl", "top_documents.jsonl", "error_analysis.json", "retrieval_ceiling.png", "benchmark_report.md")
 
 
@@ -30,7 +39,7 @@ class BenchmarkConfig:
     dataset: str = "nq"
     rerank_k: int = 20
     at_k: int = 10
-    methods: tuple[str, ...] = ALL_METHODS
+    methods: tuple[str, ...] = DEFAULT_METHODS
     limit_queries: int | None = None
     cache_dir: Path = Path("artifacts/cache")
     output_dir: Path = Path("artifacts")
@@ -39,8 +48,15 @@ class BenchmarkConfig:
     concurrency: int = 16
     jev_model: str = "jev-latest"
     jev_input_price_per_million: float = 0.042
+    openai_model: str = "gpt-5.4-nano-2026-03-17"
+    gemini_model: str = "gemini-3.5-flash-lite"
+    openai_input_price_per_million: float = 0.20
+    openai_output_price_per_million: float = 1.25
+    gemini_input_price_per_million: float = 0.30
+    gemini_output_price_per_million: float = 2.50
     seed: int = 42
     refresh_jev: bool = False
+    refresh_provider: bool = False
     cross_encoder_batch_size: int = 32
     device: str | None = None
     cross_encoder_models: dict[str, str] | None = None
@@ -100,7 +116,7 @@ async def _run_jev_method(
                 result.resolved_models.add(parsed.resolved_model)
             except Exception as exc:
                 live_intervals.append((live_started, time.perf_counter()))
-                result.api_calls += int(getattr(exc, "attempts", 1))
+                result.api_calls += max(1, int(getattr(exc, "attempts", 1)))
                 result.retries += int(getattr(exc, "retries", 0))
                 error = {**base, "success": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
                 await cache.append(error)
@@ -113,6 +129,103 @@ async def _run_jev_method(
         if len(scores[example.query_id]) == len(example.candidates):
             ordered_scores = [scores[example.query_id][c.document_id] for c in example.candidates]
             result.rankings[example.query_id] = rank_scores(ordered_scores, [c.document_id for c in example.candidates])
+    result.total_seconds = time.perf_counter() - started
+    if live_intervals:
+        result.live_call_seconds = max(end for _, end in live_intervals) - min(begin for begin, _ in live_intervals)
+    return result
+
+
+async def _run_provider_method(
+    method: str,
+    data: BenchmarkData,
+    config: BenchmarkConfig,
+    cache: JsonlCache,
+    api_key: str,
+    model: str,
+) -> MethodResult:
+    provider = method_provider(method)
+    result = MethodResult(method, {})
+    scores: dict[str, dict[str, float]] = {example.query_id: {} for example in data.examples}
+    started = time.perf_counter()
+    live_intervals: list[tuple[float, float]] = []
+
+    async with ProviderClient(
+        provider, api_key, model, config.request_timeout, config.max_retries, config.concurrency
+    ) as client:
+        async def score_one(example: QueryExample, candidate: Any) -> None:
+            payload = build_provider_payload(method, example.text, candidate.text, model)
+            key = cache_key(
+                data.repository, data.fingerprint, data.split, example.query_id,
+                candidate.document_id, method, payload, model,
+            )
+            cached = None if config.refresh_provider else cache.get(key)
+            if cached is not None:
+                score, input_tokens, output_tokens, version = _cached_parsed(cached)
+                scores[example.query_id][candidate.document_id] = score
+                result.cache_hits += 1
+                result.cached_input_tokens += input_tokens
+                result.cached_output_tokens += output_tokens
+                result.resolved_models.add(version)
+                return
+            base = {
+                "cache_key": key,
+                "provider": provider,
+                "dataset": data.repository,
+                "dataset_fingerprint": data.fingerprint,
+                "split": data.split,
+                "query_id": example.query_id,
+                "document_id": candidate.document_id,
+                "method": method,
+                "query_text": example.text,
+                "document_text": candidate.text,
+                "request_payload": payload,
+                "requested_model": model,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            live_started = time.perf_counter()
+            try:
+                call = await client.score(payload, method)
+                live_intervals.append((live_started, time.perf_counter()))
+                parsed = call.parsed
+                record = {
+                    **base,
+                    "success": True,
+                    "ranking_score": parsed.score,
+                    "complete_answer": parsed.answer,
+                    "resolved_model_version": parsed.resolved_model,
+                    "input_tokens": parsed.input_tokens,
+                    "output_tokens": parsed.output_tokens,
+                    "usage": parsed.usage,
+                    "latency_seconds": call.latency,
+                    "retries": call.retries,
+                }
+                await cache.append(record)
+                scores[example.query_id][candidate.document_id] = parsed.score
+                result.pair_latencies.append(call.latency)
+                result.api_calls += 1 + call.retries
+                result.successful_uncached_pairs += 1
+                result.input_tokens += parsed.input_tokens
+                result.output_tokens += parsed.output_tokens
+                result.retries += call.retries
+                result.resolved_models.add(parsed.resolved_model)
+            except Exception as exc:
+                live_intervals.append((live_started, time.perf_counter()))
+                result.api_calls += max(1, int(getattr(exc, "attempts", 1)))
+                result.retries += int(getattr(exc, "retries", 0))
+                error = {**base, "success": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+                await cache.append(error)
+                result.errors.append(error)
+
+        await asyncio.gather(
+            *(score_one(example, candidate) for example in data.examples for candidate in example.candidates)
+        )
+
+    for example in data.examples:
+        if len(scores[example.query_id]) == len(example.candidates):
+            result.rankings[example.query_id] = rank_scores(
+                [scores[example.query_id][candidate.document_id] for candidate in example.candidates],
+                [candidate.document_id for candidate in example.candidates],
+            )
     result.total_seconds = time.perf_counter() - started
     if live_intervals:
         result.live_call_seconds = max(end for _, end in live_intervals) - min(begin for begin, _ in live_intervals)
@@ -140,9 +253,15 @@ def run_benchmark(config: BenchmarkConfig) -> Path:
     if config.rerank_k <= 0 or config.at_k <= 0:
         raise ValueError("--rerank-k and --at-k must be positive")
     jev_methods = [method for method in config.methods if method.startswith("jev-")]
-    api_key = os.environ.get("TYPESAFE_API_KEY", "")
-    if jev_methods and not api_key:
+    jev_api_key = os.environ.get("TYPESAFE_API_KEY", "")
+    openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+    gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+    if jev_methods and not jev_api_key:
         raise ValueError("TYPESAFE_API_KEY is required when Jev methods are selected; BM25 and MiniLM methods work without it")
+    if any(method.startswith("openai-") for method in config.methods) and not openai_api_key:
+        raise ValueError("OPENAI_API_KEY is required when OpenAI methods are selected")
+    if any(method.startswith("gemini-") for method in config.methods) and not gemini_api_key:
+        raise ValueError("GEMINI_API_KEY is required when Gemini methods are selected")
 
     data = load_nanobeir(config.dataset, config.rerank_k, config.limit_queries)
     if not data.examples:
@@ -151,8 +270,13 @@ def run_benchmark(config: BenchmarkConfig) -> Path:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
     run_dir = config.output_dir / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
-    cache = JsonlCache(config.cache_dir / "jev-results.jsonl")
-    cache.load()
+    caches = {
+        "jev": JsonlCache(config.cache_dir / "jev-results.jsonl"),
+        "openai": JsonlCache(config.cache_dir / "openai-results.jsonl"),
+        "gemini": JsonlCache(config.cache_dir / "gemini-results.jsonl"),
+    }
+    for cache in caches.values():
+        cache.load()
     model_ids = dict(DEFAULT_MODELS)
     model_ids.update(config.cross_encoder_models or {})
     config_record = {
@@ -165,6 +289,7 @@ def run_benchmark(config: BenchmarkConfig) -> Path:
             "binary": {"instructions": BINARY_INSTRUCTIONS, "criteria": BINARY_CRITERIA},
             "graded": {"instructions": GRADED_INSTRUCTIONS, "criteria": GRADED_CRITERIA},
         },
+        "provider_prompts": {"binary": PROVIDER_BINARY_PROMPT, "graded": PROVIDER_GRADED_PROMPT},
     }
     write_json(run_dir / "config.json", config_record)
 
@@ -180,7 +305,13 @@ def run_benchmark(config: BenchmarkConfig) -> Path:
             results[method] = run_cross_encoder(method, model_ids[method], data.examples, config.cross_encoder_batch_size, config.device)
     for method in ("jev-binary", "jev-graded"):
         if method in config.methods:
-            results[method] = asyncio.run(_run_jev_method(method, data, config, cache, api_key))
+            results[method] = asyncio.run(_run_jev_method(method, data, config, caches["jev"], jev_api_key))
+    for method in PROVIDER_METHODS:
+        if method in config.methods:
+            provider = method_provider(method)
+            model = config.openai_model if provider == "openai" else config.gemini_model
+            key = openai_api_key if provider == "openai" else gemini_api_key
+            results[method] = asyncio.run(_run_provider_method(method, data, config, caches[provider], key, model))
 
     all_errors = [error for result in results.values() for error in result.errors]
     incomplete_methods = [method for method, result in results.items() if len(result.rankings) != len(data.examples)]
@@ -189,7 +320,18 @@ def run_benchmark(config: BenchmarkConfig) -> Path:
 
     complete_results = {method: result for method, result in results.items() if len(result.rankings) == len(data.examples)}
     metrics = {method: evaluate(result.rankings, data.examples, config.at_k, config.rerank_k) for method, result in complete_results.items()}
-    efficiencies = {method: efficiency(result, config.jev_input_price_per_million) for method, result in complete_results.items()}
+    prices = {
+        "jev-binary": (config.jev_input_price_per_million, 0.0),
+        "jev-graded": (config.jev_input_price_per_million, 0.0),
+        "openai-binary": (config.openai_input_price_per_million, config.openai_output_price_per_million),
+        "openai-graded": (config.openai_input_price_per_million, config.openai_output_price_per_million),
+        "gemini-binary": (config.gemini_input_price_per_million, config.gemini_output_price_per_million),
+        "gemini-graded": (config.gemini_input_price_per_million, config.gemini_output_price_per_million),
+    }
+    efficiencies = {
+        method: efficiency(result, *prices.get(method, (0.0, 0.0)))
+        for method, result in complete_results.items()
+    }
     oracle = evaluate(oracle_rankings(data.examples), data.examples, config.at_k, config.rerank_k)
     ceiling = candidate_recall(data.examples)
     metrics_payload = {"methods": metrics, "efficiency": efficiencies, "candidate_recall_at_rerank_k": ceiling, "candidate_oracle": oracle}

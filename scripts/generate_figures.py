@@ -12,13 +12,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-METHOD_ORDER = ["bm25", "minilm-l4", "minilm-l6", "jev-binary", "jev-graded"]
+METHOD_ORDER = [
+    "bm25", "minilm-l4", "minilm-l6", "jev-binary", "jev-graded",
+    "openai-binary", "openai-graded", "gemini-binary", "gemini-graded",
+]
 METHOD_LABELS = {
     "bm25": "BM25",
     "minilm-l4": "MiniLM L4",
     "minilm-l6": "MiniLM L6",
     "jev-binary": "Jev binary",
     "jev-graded": "Jev graded",
+    "openai-binary": "OpenAI binary",
+    "openai-graded": "OpenAI graded",
+    "gemini-binary": "Gemini binary",
+    "gemini-graded": "Gemini graded",
 }
 COLORS = {
     "bm25": "#6B7280",
@@ -26,6 +33,10 @@ COLORS = {
     "minilm-l6": "#2563EB",
     "jev-binary": "#059669",
     "jev-graded": "#7C3AED",
+    "openai-binary": "#0F766E",
+    "openai-graded": "#14B8A6",
+    "gemini-binary": "#DC2626",
+    "gemini-graded": "#F59E0B",
 }
 
 
@@ -63,15 +74,16 @@ def _save(fig: plt.Figure, output_dir: Path, stem: str) -> None:
 
 def quality_figure(metrics: dict[str, Any], output_dir: Path) -> None:
     method_metrics = metrics["methods"]
+    methods = [method for method in METHOD_ORDER if method in method_metrics]
     dimensions = [("ndcg", "nDCG@10"), ("mrr", "MRR@10"), ("map", "MAP@20"), ("recall", "Recall@10")]
-    fig, axes = plt.subplots(2, 2, figsize=(11, 7.2), sharex=True)
-    y = np.arange(len(METHOD_ORDER))
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9.2), sharex=True)
+    y = np.arange(len(methods))
     for axis, (key, title) in zip(axes.flat, dimensions):
-        values = [method_metrics[method][key] for method in METHOD_ORDER]
-        axis.barh(y, values, color=[COLORS[m] for m in METHOD_ORDER], height=0.66)
+        values = [method_metrics[method][key] for method in methods]
+        axis.barh(y, values, color=[COLORS[m] for m in methods], height=0.66)
         axis.set_title(title, loc="left", fontweight="bold")
         axis.set_xlim(0, 1.0)
-        axis.set_yticks(y, [METHOD_LABELS[m] for m in METHOD_ORDER])
+        axis.set_yticks(y, [METHOD_LABELS[m] for m in methods])
         axis.invert_yaxis()
         axis.grid(axis="x", color="#E5E7EB", linewidth=0.8)
         axis.set_axisbelow(True)
@@ -85,7 +97,7 @@ def quality_figure(metrics: dict[str, Any], output_dir: Path) -> None:
 
 def efficiency_figure(metrics: dict[str, Any], output_dir: Path) -> None:
     efficiencies = metrics["efficiency"]
-    methods = METHOD_ORDER
+    methods = [method for method in METHOD_ORDER if method in efficiencies]
     labels = [METHOD_LABELS[m] for m in methods]
     colors = [COLORS[m] for m in methods]
     total_seconds = [efficiencies[m]["total_seconds"] for m in methods]
@@ -121,21 +133,30 @@ def efficiency_figure(metrics: dict[str, Any], output_dir: Path) -> None:
     _save(fig, output_dir, "efficiency-comparison")
 
 
-def jev_operational_figure(metrics: dict[str, Any], output_dir: Path) -> None:
+def api_operational_figure(metrics: dict[str, Any], output_dir: Path) -> None:
     efficiencies = metrics["efficiency"]
-    methods = ["jev-binary", "jev-graded"]
+    methods = [method for method in METHOD_ORDER if method.endswith(("-binary", "-graded")) and method in efficiencies]
     labels = [METHOD_LABELS[m] for m in methods]
-    x = np.arange(2)
+    x = np.arange(len(methods))
     p50 = [efficiencies[m]["p50_pair_latency_seconds"] for m in methods]
     p95 = [efficiencies[m]["p95_pair_latency_seconds"] for m in methods]
-    costs = [efficiencies[m]["estimated_cost"] for m in methods]
-    tokens = [efficiencies[m]["input_tokens"] for m in methods]
+    costs = []
+    tokens = []
+    for method in methods:
+        row = efficiencies[method]
+        cached_cost = (
+            row.get("cached_input_tokens", 0) / 1_000_000 * row.get("input_price_per_million", 0.0)
+            + row.get("cached_output_tokens", 0) / 1_000_000 * row.get("output_price_per_million", 0.0)
+        )
+        costs.append(row["estimated_cost"] + cached_cost)
+        tokens.append(row["input_tokens"] + row.get("cached_input_tokens", 0))
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.8))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.4))
     width = 0.34
     axes[0].bar(x - width / 2, p50, width, label="p50", color="#93C5FD")
     axes[0].bar(x + width / 2, p95, width, label="p95", color="#2563EB")
     axes[0].set_xticks(x, labels)
+    axes[0].tick_params(axis="x", rotation=25)
     axes[0].set_ylabel("Latency per uncached pair (seconds)")
     axes[0].set_title("Live API latency", loc="left", fontweight="bold")
     axes[0].grid(axis="y", color="#E5E7EB", linewidth=0.8)
@@ -148,17 +169,32 @@ def jev_operational_figure(metrics: dict[str, Any], output_dir: Path) -> None:
 
     axes[1].bar(x, costs, color=[COLORS[m] for m in methods], width=0.58)
     axes[1].set_xticks(x, labels)
-    axes[1].set_ylabel("Estimated input-token cost (USD)")
+    axes[1].tick_params(axis="x", rotation=25)
+    axes[1].set_ylabel("Estimated input + output cost (USD)")
     axes[1].set_title("Cost for 1,000 scored pairs", loc="left", fontweight="bold")
     axes[1].grid(axis="y", color="#E5E7EB", linewidth=0.8)
     axes[1].set_axisbelow(True)
     axes[1].ticklabel_format(axis="y", style="plain")
     for position, cost, token_count in zip(x, costs, tokens):
         axes[1].text(position, cost + 0.00045, f"${cost:.4f}\n{token_count:,} tokens", ha="center", fontsize=9)
-    fig.suptitle("Jev operational profile", fontsize=16, fontweight="bold", x=0.07, ha="left")
-    fig.text(0.07, 0.90, "2,000 successful calls · zero retries · resolved model jev-1.13.0", color="#4B5563")
+    total_calls = sum(efficiencies[method]["api_calls"] for method in methods)
+    total_cached = sum(efficiencies[method].get("cache_hits", 0) for method in methods)
+    total_pairs = sum(
+        efficiencies[method].get("successful_uncached_pairs", 0)
+        + efficiencies[method].get("cache_hits", 0)
+        for method in methods
+    )
+    total_retries = sum(efficiencies[method]["retries"] for method in methods)
+    fig.suptitle("API reranker operational profile", fontsize=16, fontweight="bold", x=0.07, ha="left")
+    fig.text(
+        0.07,
+        0.90,
+        f"{total_pairs:,} scored pairs | {total_calls:,} calls in completed runs | "
+        f"{total_cached:,} resumed from cache | {total_retries:,} retries",
+        color="#4B5563",
+    )
     fig.tight_layout(rect=(0, 0, 1, 0.86))
-    _save(fig, output_dir, "jev-latency-cost")
+    _save(fig, output_dir, "api-latency-cost")
 
 
 def reciprocal_rank_change_figure(pair_scores: list[dict[str, Any]], output_dir: Path) -> None:
@@ -222,7 +258,7 @@ def main() -> None:
     pair_scores = _load_jsonl(output_dir / "pair_scores.jsonl")
     quality_figure(metrics, output_dir)
     efficiency_figure(metrics, output_dir)
-    jev_operational_figure(metrics, output_dir)
+    api_operational_figure(metrics, output_dir)
     reciprocal_rank_change_figure(pair_scores, output_dir)
     print(f"Wrote 8 figure files to {output_dir}")
 

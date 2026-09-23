@@ -63,9 +63,15 @@ class JsonlCache:
         line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
         async with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8", newline="") as handle:
-                handle.write(line)
-                handle.flush()
+            for attempt in range(6):
+                try:
+                    with self.path.open("a", encoding="utf-8", newline="") as handle:
+                        handle.write(line)
+                        handle.flush()
+                    break
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    await asyncio.sleep(0.05 * (attempt + 1))
             if record.get("success") is True:
                 self._records[record["cache_key"]] = record
-

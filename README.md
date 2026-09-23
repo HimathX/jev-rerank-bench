@@ -10,6 +10,13 @@ The five methods are:
 - Jev `noul` binary relevance; and
 - Jev `score` graded relevance.
 
+Optional provider comparisons use the same candidates and fixed relevance rubrics:
+
+- OpenAI binary and graded scoring with `gpt-5.4-nano-2026-03-17`;
+- Gemini binary and graded scoring with `gemini-3.5-flash-lite`.
+
+Their numeric values are model-reported ranking scores, not calibrated probabilities and not native equivalents of Jev's evaluation primitives.
+
 Every reranker receives exactly the same BM25 top-k documents. Missing relevant documents are never injected. Cross-encoder background and evaluation APIs are documented by [Sentence Transformers](https://sbert.net/docs/package_reference/cross_encoder/evaluation.html).
 
 ## Installation
@@ -44,6 +51,16 @@ uv run python -m jev_rank benchmark --dataset nq --rerank-k 20 --at-k 10 --metho
 ```
 
 There are 1,000 unique query-document pairs. Because binary and graded relevance are separate requests, a cold-cache full run makes 2,000 Jev API requests, excluding retries. The key is read only from `TYPESAFE_API_KEY`; it is never logged. A missing key fails early only when a Jev method is selected.
+
+To include the OpenAI and Gemini comparisons:
+
+```powershell
+$env:OPENAI_API_KEY = "your-key"
+$env:GEMINI_API_KEY = "your-key"
+uv run python -m jev_rank benchmark --dataset nq --rerank-k 20 --at-k 10 --methods bm25,minilm-l4,minilm-l6,jev-binary,jev-graded,openai-binary,openai-graded,gemini-binary,gemini-graded --concurrency 16
+```
+
+Those four additional methods make 4,000 cold-cache API requests. Successful responses are stored separately in `openai-results.jsonl` and `gemini-results.jsonl`. Use `--refresh-provider` only when deliberately bypassing these paid cache entries.
 
 Useful options include `--request-timeout`, `--max-retries`, `--jev-model`, `--jev-input-price-per-million`, `--seed`, `--refresh-jev`, `--cache-dir`, `--output-dir`, `--cross-encoder-batch-size`, and `--device`. The `--minilm-l4-model` and `--minilm-l6-model` options accept any `CrossEncoder`-compatible model identifier without changes to evaluation code. Use `--help` for defaults. Device selection is automatic unless `--device` is supplied.
 

@@ -16,6 +16,10 @@ DISPLAY_NAMES = {
     "minilm-l6": "MiniLM L6",
     "jev-binary": "Jev binary",
     "jev-graded": "Jev graded",
+    "openai-binary": "OpenAI binary",
+    "openai-graded": "OpenAI graded",
+    "gemini-binary": "Gemini binary",
+    "gemini-graded": "Gemini graded",
 }
 
 
@@ -30,9 +34,11 @@ def percentile(values: Sequence[float], p: float) -> float:
     return ordered[lower] * (upper - index) + ordered[upper] * (index - lower)
 
 
-def efficiency(result: MethodResult, price: float) -> dict[str, Any]:
+def efficiency(result: MethodResult, input_price: float, output_price: float = 0.0) -> dict[str, Any]:
     live_time = result.live_call_seconds
-    cost = result.input_tokens / 1_000_000 * price
+    input_cost = result.input_tokens / 1_000_000 * input_price
+    output_cost = result.output_tokens / 1_000_000 * output_price
+    cost = input_cost + output_cost
     total_seen = result.cache_hits + result.successful_uncached_pairs
     return {
         "total_seconds": result.total_seconds,
@@ -49,6 +55,10 @@ def efficiency(result: MethodResult, price: float) -> dict[str, Any]:
         "cached_input_tokens": result.cached_input_tokens,
         "cached_output_tokens": result.cached_output_tokens,
         "estimated_cost": cost,
+        "estimated_input_cost": input_cost,
+        "estimated_output_cost": output_cost,
+        "input_price_per_million": input_price,
+        "output_price_per_million": output_price,
         "estimated_cost_per_paid_pair": cost / result.successful_uncached_pairs if result.successful_uncached_pairs else 0.0,
         "retries": result.retries,
         "resolved_models": sorted(result.resolved_models),
@@ -148,16 +158,15 @@ def build_report(
         "Qrel-based candidate-set oracle (evaluation-only, unattainable under available judgments; not a model): ", "",
         f"nDCG@{at_k} {oracle['ndcg']:.4f}; MRR@{at_k} {oracle['mrr']:.4f}; MAP@{rerank_k} {oracle['map']:.4f}; Recall@{at_k} {oracle['recall']:.4f}.", "",
         "## Main metrics", "", _metric_table(metrics, at_k, rerank_k), "",
-        "## Latency and cost", "", "API latency percentiles and live throughput use uncached Jev calls only. Cost is `input_tokens / 1,000,000 * configured input price`; output tokens are recorded but excluded because output pricing is documented as free.", "",
+        "## Latency and cost", "", "API latency percentiles and live throughput use uncached requests only. Estimated cost is `input_tokens / 1,000,000 * input price + output_tokens / 1,000,000 * output price`. Jev output price is zero; OpenAI and Gemini output tokens are included.", "",
         "| Method | Total s | Mean s | p50 s | p95 s | Pairs/s | API calls | New input/output tokens | Est. cost | Cost/paid pair | Cache hits (rate) | Retries |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for method, row in efficiencies.items():
         lines.append(f"| {DISPLAY_NAMES.get(method, method)} | {row['total_seconds']:.3f} | {row['mean_pair_latency_seconds']:.3f} | {row['p50_pair_latency_seconds']:.3f} | {row['p95_pair_latency_seconds']:.3f} | {row['pairs_per_second']:.2f} | {row['api_calls']} | {row['input_tokens']}/{row['output_tokens']} | ${row['estimated_cost']:.6f} | ${row['estimated_cost_per_paid_pair']:.6f} | {row['cache_hits']} ({row['cache_hit_rate']:.1%}) | {row['retries']} |")
-    jev_versions = sorted({version for row in efficiencies.values() for version in row["resolved_models"]})
+    resolved_versions = sorted({version for row in efficiencies.values() for version in row["resolved_models"]})
     cached_tokens = sum(row["cached_input_tokens"] for row in efficiencies.values()), sum(row["cached_output_tokens"] for row in efficiencies.values())
-    lines += ["", f"Configured Jev input price: ${config['jev_input_price_per_million']} per million tokens. Cost-per-pair denominator is successful uncached Jev pairs. Configured concurrency: {config['concurrency']}. Cached token metadata (excluded from new cost): {cached_tokens[0]} input / {cached_tokens[1]} output.", "", f"Requested Jev model: `{config['jev_model']}`. Resolved versions present: {', '.join(f'`{v}`' for v in jev_versions) if jev_versions else 'none (no Jev calls)'}." ]
-    if len(jev_versions) > 1:
-        lines += ["", "**Warning:** this run/cache mixes multiple resolved Jev model versions."]
+    lines += ["", f"Cost-per-pair denominator is successful uncached pairs. Configured concurrency: {config['concurrency']}. Cached token metadata (excluded from new cost): {cached_tokens[0]} input / {cached_tokens[1]} output.", "", f"Requested models: Jev `{config['jev_model']}`, OpenAI `{config['openai_model']}`, Gemini `{config['gemini_model']}`. Resolved versions present: {', '.join(f'`{v}`' for v in resolved_versions) if resolved_versions else 'none (no API calls)'}." ]
+    lines += ["", f"Configured per-million-token prices — Jev input/output: ${config['jev_input_price_per_million']}/$0; OpenAI: ${config['openai_input_price_per_million']}/${config['openai_output_price_per_million']}; Gemini: ${config['gemini_input_price_per_million']}/${config['gemini_output_price_per_million']}."]
     if chart_error:
         lines += ["", f"Plotting failed, but numeric results were preserved: `{chart_error}`"]
     lines += ["", "## Top-three comparison", "", "Scores are method-specific and should only be compared within a method.", ""]
@@ -167,7 +176,7 @@ def build_report(
             excerpt = str(doc["excerpt"]).replace("|", "\\|")
             lines.append(f"| {doc['rank']} | `{doc['document_id']}` | {doc['score']:.6f} | {doc['original_bm25_position']} | {doc['relevant']} | {excerpt} |")
         lines.append("")
-    lines += ["## Deterministic qualitative diagnostics", "", "These predeclared, qrel-based selected cases are diagnostic—not representative statistical evidence.", ""]
+    lines += ["## Deterministic qualitative diagnostics", "", "These predeclared, qrel-based selected cases are diagnostic—not representative statistical evidence. OpenAI and Gemini probabilities/scores are model-reported ranking values, not calibrated probabilities.", ""]
     if cases:
         labels = {"largest_jev_graded_improvement": "Largest Jev graded improvement", "largest_jev_graded_regression": "Largest Jev graded regression", "strongest_jev_disagreement": "Strongest Jev binary/graded Kendall disagreement"}
         record_map = {(r["query_id"], r["method"]): r for r in top_records}
