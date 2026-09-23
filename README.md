@@ -19,6 +19,42 @@ Their numeric values are model-reported ranking scores, not calibrated probabili
 
 Every reranker receives exactly the same BM25 top-k documents. Missing relevant documents are never injected. Cross-encoder background and evaluation APIs are documented by [Sentence Transformers](https://sbert.net/docs/package_reference/cross_encoder/evaluation.html).
 
+## Benchmark results
+
+The completed NanoNQ pilot uses 50 queries and reranks the same BM25 top-20 candidates for every method. Higher is better for every metric. These results are descriptive; the small dataset does not support claims of statistical significance.
+
+| Method | nDCG@10 | MRR@10 | MAP@20 | Recall@10 |
+|---|---:|---:|---:|---:|
+| BM25 | 0.501 | 0.427 | 0.418 | 0.760 |
+| MiniLM L4 | 0.742 | 0.732 | 0.708 | 0.820 |
+| MiniLM L6 | 0.736 | 0.725 | 0.699 | 0.820 |
+| Jev binary | 0.777 | 0.765 | 0.742 | 0.860 |
+| **Jev graded** | **0.785** | **0.776** | **0.752** | **0.860** |
+| OpenAI binary | 0.671 | 0.625 | 0.602 | 0.860 |
+| OpenAI graded | 0.666 | 0.617 | 0.599 | 0.850 |
+| Gemini binary | 0.759 | 0.742 | 0.716 | 0.860 |
+| Gemini graded | 0.756 | 0.741 | 0.713 | 0.860 |
+
+Jev graded produced the strongest result on nDCG@10, MRR@10, and MAP@20. Gemini binary was the strongest of the added general-purpose model baselines. The shared BM25 candidate pool has Recall@20 of 0.860, so no reranker can recover relevant documents missing from that pool.
+
+![Quality metrics for all nine benchmark methods](docs/figures/quality-metrics.png)
+
+### Efficiency, latency, and estimated cost
+
+Latency reflects the observed live calls and can vary with provider load and network conditions. The cost comparison normalizes each API method to all 1,000 scored query-document pairs, including the 592 OpenAI responses recovered from the interrupted run's local cache.
+
+![Runtime and throughput comparison](docs/figures/efficiency-comparison.png)
+
+![API latency and estimated cost comparison](docs/figures/api-latency-cost.png)
+
+### Per-query behavior
+
+The following diagnostic shows reciprocal-rank changes against BM25 for the two Jev formulations. Individual-query changes should not be treated as representative evidence.
+
+![Per-query reciprocal-rank changes against BM25](docs/figures/per-query-rr-change.png)
+
+Machine-readable results and the full query-level report are generated in `artifacts/results/`. The merged run completed 9,000 method-query-document scores and 450 query-method rankings. All 4,000 OpenAI and Gemini responses were successfully cached, with no retryable provider failures in the completed benchmark.
+
 ## Installation
 
 Install [uv](https://docs.astral.sh/uv/), then synchronize the locked environment:
